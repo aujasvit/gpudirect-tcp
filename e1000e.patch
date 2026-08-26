@@ -1,0 +1,1983 @@
+diff --git a/gdr_common.h b/gdr_common.h
+new file mode 100644
+index 0000000..d7656d7
+--- /dev/null
++++ b/gdr_common.h
+@@ -0,0 +1,98 @@
++// gdr_common.h
++// Hello123
++
++#ifndef _GPU_DMA_COMMON_H
++#define _GPU_DMA_COMMON_H
++
++#include <linux/types.h>
++
++#define GDR_MAGIC 0x12345678
++
++typedef struct __attribute__((packed)) gdr_mem_setup {
++	void *cmem_addr; // control mem addr, GPU VA
++	size_t cmem_length;
++
++	void *pmem_addr; // packet mem addr, GPU VA
++	size_t pmem_length;
++
++	uint32_t magic;
++} gdr_mem_setup_t;
++#define GDR_MEM_SETUP_T_SZ (8 + 8 + 8 + 8 + 4)
++
++#define NIC_INFO_SZ 32
++
++typedef struct __attribute__((packed)) pkt_desc {
++	// depending on where the memory for descriptors belongs
++	union {
++		void* gpu_va; 
++		uint64_t offset; // useful when communicating b/w controller <-> e1000e
++	};
++	size_t length;
++
++	// for use by NIC driver to store info needed to re-insert packets into kernel networking stack
++	uint8_t nic_info[NIC_INFO_SZ]; 
++
++	uint32_t checksum_verified;
++
++	uint32_t magic;
++} pkt_desc_t;
++#define PKT_DESC_T_SZ (8 + 8 + NIC_INFO_SZ + 4 + 4)
++
++// producer writes to head, consumer consumes from tail
++// memory for descriptors is assumed to be in [*_va, *_va + length_bytes)
++// so the i'th slot would be at va_start + i*slot_sz
++typedef struct __attribute__((packed)) spsc_ring {
++	// Ptr to start of descriptor memory
++	union {
++		void *gpu_va;
++		void *userspace_va;
++	};
++	// Another ptr to the start of descriptor memory
++	// Can be used when producer/consumer are in different address spaces, and the ring 
++	// has been mapped into both
++	union {
++		void *kernel_va;
++	} va2;
++	size_t length_bytes;
++
++	// head/tail should be aligned even with the struct being packed.
++	// without alignment, I believe tearing could occur during reads/writes on x86_64, which could cause 
++	// weird issues.
++	int head;
++	int tail;
++	int num_slots;
++	int slot_sz;
++
++	uint32_t magic;
++} spsc_ring_t;
++#define SPSC_RING_T_SZ (8 + 8 + 8 + 4 + 4 + 4 + 4 + 4)
++
++typedef struct __attribute__((packed)) gdr_config {
++	spsc_ring_t rx_ring; // rx to GPU
++	spsc_ring_t redirect_ring; // packets to be redirected towards cpu
++	spsc_ring_t tx_ring; // packets GPU stack wants to tx
++} gdr_env_t;
++
++#define GDR_CONFIG_T_SZ (3 * SPSC_RING_T_SZ)
++
++#define GPU_PAGE_SIZE (1 << 16)
++#define CPU_PAGE_SIZE (1 << 12)
++
++// All queues - rx, redirect, inject, tx - use pkt_desc_t as their entries, and each of them have a size of 
++// NUM_SLOTS. 
++#define QUEUE_ENTRY_SZ 64 // roundup_pow_of_two(sizeof(pkt_desc_t))
++#define NUM_SLOTS 4096
++
++#define PACKET_SZ 2048 // Ethernet max size in e1000e ~1522
++#define PMEM_SZ (NUM_SLOTS * PACKET_SZ) // PMEM has enough space to hold NUM_SLOTS packets
++
++#define CMEM_QUEUE_CNT 3 // rx, redirect, tx
++// first page is used for gdr_config
++// CMEM has space for rx, redirect, tx rings
++#define CMEM_SZ (GPU_PAGE_SIZE + NUM_SLOTS * QUEUE_ENTRY_SZ * CMEM_QUEUE_CNT)
++
++// imem = [spsc_ring_t][descriptors][data memory]
++// first page is used for spsc_ring_t
++#define IMEM_SZ (CPU_PAGE_SIZE + NUM_SLOTS * QUEUE_ENTRY_SZ + NUM_SLOTS * PACKET_SZ)
++
++#endif // _GPU_DMA_COMMON_H
+diff --git a/netdev.c b/netdev.c
+index 55cf2f6..bbf5195 100644
+--- a/netdev.c
++++ b/netdev.c
+@@ -1,13 +1,14 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /* Copyright(c) 1999 - 2018 Intel Corporation. */
+ 
+-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+-
++#include "linux/wait.h"
+ #include <linux/module.h>
++#include <linux/log2.h>
+ #include <linux/types.h>
+ #include <linux/init.h>
+ #include <linux/pci.h>
+ #include <linux/vmalloc.h>
++#include <linux/io.h>
+ #include <linux/pagemap.h>
+ #include <linux/delay.h>
+ #include <linux/netdevice.h>
+@@ -28,6 +29,8 @@
+ #include <linux/suspend.h>
+ 
+ #include "e1000.h"
++#include "nv-p2p.h"
++#include "gdr_common.h"
+ 
+ char e1000e_driver_name[] = "e1000e";
+ 
+@@ -106,6 +109,788 @@ static const struct e1000_reg_info e1000_reg_info_tbl[] = {
+ 	{0, NULL}
+ };
+ 
++/* GDR Code Start */
++
++// for boundary alignment requirement
++#define GPU_BOUND_SHIFT   16
++#define GPU_BOUND_SIZE    ((u64)1 << GPU_BOUND_SHIFT)
++#define GPU_BOUND_OFFSET  (GPU_BOUND_SIZE-1)
++#define GPU_BOUND_MASK    (~GPU_BOUND_OFFSET)
++
++typedef struct pkt_info {
++	u32 length;
++	u32 staterr;
++	union e1000_rx_desc_extended rx_desc;
++} pkt_info_t;
++
++typedef struct pmem_desc {
++	/* Constant throughout lifetime of pmem */
++	uint64_t gpu_va;
++	uint64_t dma_addr;
++	void __iomem *mmio_addr;
++	size_t space; // space available for packet, bytes
++
++	/* Modified as packets are written and read */
++	bool is_free; // Used to detect if during allocation we are overwriting packets
++} pmem_desc_t;
++
++#define INJECT_RING_SZ NUM_SLOTS
++
++typedef void* gpu_phys_t;
++
++// NOTE: Don't forget to initialize variables inside module_init!
++struct {
++	struct e1000_adapter *adapter;
++
++	bool enabled;
++	nvidia_p2p_page_table_t* cmem_page_table;
++	nvidia_p2p_dma_mapping_t* cmem_dma_mapping;
++	nvidia_p2p_page_table_t* pmem_page_table;
++	nvidia_p2p_dma_mapping_t* pmem_dma_mapping;
++	struct pci_dev* pdev;
++
++	gdr_mem_setup_t mem_setup;
++
++	int pmem_size; // no. of usable slots (based off actual memory allocated)
++	pmem_desc_t pmem[NUM_SLOTS];
++	int alloc_idx;
++
++	/* Control memory (cmem) structs start */
++
++	// NOTE: some of these structs are packed.. so for (minimal?) optimization it is be better to 
++	// copy them over into a struct with proper alignment instead.
++	gdr_env_t __iomem *cmem_env_mmio;
++	gpu_phys_t cmem_env_phys;
++	spsc_ring_t __iomem *rx_ring_mmio;
++	spsc_ring_t __iomem *redirect_ring_mmio;
++	spsc_ring_t __iomem *tx_ring_mmio;
++
++	int redirect_ring_size;
++	gpu_phys_t phys_map_redirect_ring[NUM_SLOTS]; // gpu phys addr of descriptors
++
++	int tx_ring_size;
++	gpu_phys_t phys_map_tx_ring[NUM_SLOTS]; // gpu phys addr of descriptors
++
++	int rx_ring_size;
++	void __iomem *mmio_map_rx_ring[NUM_SLOTS]; // mmio addr of descriptors
++
++	/* cmem end */
++
++	void *inject_memory; // imem = [spsc_ring_t][descriptors][data memory]
++	spsc_ring_t *inject_ring;
++
++	atomic_t wake_up_userspace;
++	struct wait_queue_head userspace_wq;
++} gdr;
++
++void gpu_page_table_free_callback(void* page_table) 
++{
++	// not really sure when is this called or what to do here. Should gdr be stopped, then reset e1000e? Probably.
++	// Does it really matter? Also probably no.
++	pr_alert("nvidia_p2p_get_pages free_callback invoked! when is this? add logic, see code!\n");
++
++	nvidia_p2p_free_page_table((nvidia_p2p_page_table_t*)page_table);
++}
++
++int pin_and_map_gpu_mem(struct pci_dev *pdev, void* d_addr, size_t pin_size, nvidia_p2p_page_table_t** page_table,
++		nvidia_p2p_dma_mapping_t** dma_mapping)
++{
++	u64 virt_start;
++	int ret;
++	nvidia_p2p_page_table_t* pt_ptr;
++	nvidia_p2p_dma_mapping_t* dma_ptr;
++
++	virt_start = (u64)d_addr;
++	if (virt_start % GPU_BOUND_SIZE) {
++		pr_alert("pin_and_map_gpu_mem: gpu va not aligned to GPU_BOUND_SIZE\n");
++		return -1;
++	}
++	
++	if (pin_size % GPU_BOUND_SIZE) {
++		pr_alert("pin_and_map_gpu_mem: pin_size not aligned to GPU_BOUND_SIZE\n");
++	}
++
++	ret = nvidia_p2p_get_pages(0, 0, virt_start, pin_size, page_table, 
++			gpu_page_table_free_callback, *page_table);
++	if (ret != 0) {
++		pr_alert("failed to pin gpu memory, error code %d\n", ret);
++		return -1;
++	}
++
++	ret = nvidia_p2p_dma_map_pages(pdev, *page_table, dma_mapping);
++	if (ret != 0) {
++		pr_alert("failed to get dma mapping for gpu memory, error code %d\n", ret);
++		return -1;
++	}
++
++	pt_ptr = *page_table;
++	dma_ptr = *dma_mapping;
++	if (pt_ptr->entries != dma_ptr->entries) {
++		pr_alert("dma mapping entry count does not match page table entry count, wtf?\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++// [start_idx, end_idx)
++int init_rx_ring(spsc_ring_t __iomem* rx_ring, uint64_t gpu_va_start, uint32_t slot_sz,
++		nvidia_p2p_page_table_t *page_table, int start_idx, 
++		int end_idx, int* size, void __iomem** mmio_map_ring, int mmio_map_ring_sz)
++{
++	uint32_t num_slots = 0;
++	void __iomem *cpu_va;
++	uint64_t page_size;
++	int i, j;
++	int slots_per_page;
++	bool to_break = false;
++
++	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB) 
++		return -1;
++
++	if (!is_power_of_2(slot_sz)) {
++		pr_alert("spsc ring slot size must be a power of 2!\n");
++		return -1;
++	}
++	
++	page_size = 1 << 16;
++	slots_per_page = page_size / slot_sz;
++	if (!slots_per_page)
++		return -1;
++
++	for (i = start_idx; i < end_idx; i++) {
++		cpu_va = ioremap(page_table->pages[i]->physical_address,
++				page_size);
++		if (cpu_va == NULL) {
++			pr_alert("init_rx_ring: ioremap failed!\n");
++			return -1;
++		}
++		for (j = 0; j < slots_per_page; j++, cpu_va += slot_sz) {
++			if (num_slots == mmio_map_ring_sz) {
++				pr_warn("init_rx_ring: info_ring_sz insufficient\n");
++				to_break = true;
++				break;
++			}
++			mmio_map_ring[num_slots++] = cpu_va;
++		}
++		if (to_break)
++		    break;
++	}
++
++	writeq(gpu_va_start, &rx_ring->gpu_va);
++	writeq(num_slots * slot_sz, &rx_ring->length_bytes);
++
++	iowrite32(0, &rx_ring->head);
++	iowrite32(0, &rx_ring->tail);
++	iowrite32(num_slots, &rx_ring->num_slots);
++	iowrite32(slot_sz, &rx_ring->slot_sz);
++
++	iowrite32(GDR_MAGIC, &rx_ring->magic);
++
++	wmb();
++
++	*size = num_slots;
++
++	return 0;
++}
++
++// [start_idx, end_idx)
++int init_redirect_ring(spsc_ring_t __iomem *redirect_ring, uint64_t gpu_va_start, uint32_t slot_sz,
++	nvidia_p2p_page_table_t *page_table, int start_idx, int end_idx, int *size, 
++	gpu_phys_t *phys_map_ring, int phys_map_ring_sz)
++{
++	gpu_phys_t gpu_pa;
++	int slots_per_page;
++	int i, j;
++	uint32_t num_slots = 0;
++	bool to_break = false;
++
++    	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
++		return -1;
++
++	if (!is_power_of_2(slot_sz)) {
++		pr_alert("spsc ring slot size must be a power of 2!\n");
++		return -1;
++	}
++
++	slots_per_page = GPU_PAGE_SIZE / slot_sz;
++	if (!slots_per_page)
++		return -1;
++
++	for (i = start_idx; i < end_idx; i++) {
++		gpu_pa = (gpu_phys_t)page_table->pages[i]->physical_address;
++		for (j = 0; j < slots_per_page; j++, gpu_pa += slot_sz) {
++			if (num_slots == phys_map_ring_sz) {
++				pr_warn("init_redirect_ring: phys_map_ring_sz insufficient\n");
++				to_break = true;
++				break;
++			}
++			phys_map_ring[num_slots++] = gpu_pa;
++		}
++		if (to_break)
++			break;
++	}
++
++	writeq(gpu_va_start, &redirect_ring->gpu_va);
++	writeq(num_slots * slot_sz, &redirect_ring->length_bytes);
++
++	iowrite32(0, &redirect_ring->head);
++	iowrite32(0, &redirect_ring->tail);
++	iowrite32(num_slots, &redirect_ring->num_slots);
++	iowrite32(slot_sz, &redirect_ring->slot_sz);
++
++	iowrite32(GDR_MAGIC, &redirect_ring->magic);
++
++	wmb();
++
++	*size = num_slots;
++
++	return 0;
++}
++
++// [start_idx, end_idx)
++int init_tx_ring(spsc_ring_t __iomem *tx_ring, uint64_t gpu_va_start, uint32_t slot_sz,
++	nvidia_p2p_page_table_t *page_table, int start_idx, int end_idx, int *size, 
++	gpu_phys_t *phys_map_ring, int phys_map_ring_sz)
++{
++	gpu_phys_t gpu_pa;
++	int slots_per_page;
++	int i, j;
++	uint32_t num_slots = 0;
++	bool to_break = false;
++
++    	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
++		return -1;
++
++	if (!is_power_of_2(slot_sz)) {
++		pr_alert("spsc ring slot size must be a power of 2!\n");
++		return -1;
++	}
++
++	slots_per_page = GPU_PAGE_SIZE / slot_sz;
++	if (!slots_per_page)
++		return -1;
++
++	for (i = start_idx; i < end_idx; i++) {
++		gpu_pa = (gpu_phys_t)page_table->pages[i]->physical_address;
++		for (j = 0; j < slots_per_page; j++, gpu_pa += slot_sz) {
++			if (num_slots == phys_map_ring_sz) {
++				pr_warn("init_tx_ring: phys_map_ring_sz insufficient\n");
++				to_break = true;
++				break;
++			}
++			phys_map_ring[num_slots++] = gpu_pa;
++		}
++		if (to_break)
++			break;
++	}
++
++	writeq(gpu_va_start, &tx_ring->gpu_va);
++	writeq(num_slots * slot_sz, &tx_ring->length_bytes);
++
++	iowrite32(0, &tx_ring->head);
++	iowrite32(0, &tx_ring->tail);
++	iowrite32(num_slots, &tx_ring->num_slots);
++	iowrite32(slot_sz, &tx_ring->slot_sz);
++
++	iowrite32(GDR_MAGIC, &tx_ring->magic);
++
++	wmb();
++
++	*size = num_slots;
++
++	return 0;
++}
++
++// best-effort write
++void spsc_write(spsc_ring_t *ring, void __iomem **mmio_map_ring, const pkt_desc_t *desc)
++{
++	uint32_t head, tail, num_slots;
++	uint32_t next;
++
++	head = readl_relaxed(&ring->head);
++	tail = readl_relaxed(&ring->tail);
++	num_slots = readl_relaxed(&ring->num_slots);
++
++	next = (head + 1) % num_slots;
++	if (next == tail) {
++		pr_warn("spsc ring full, dropping write\n");
++		return;
++	}
++
++	memcpy_toio(mmio_map_ring[head], desc, sizeof(pkt_desc_t));
++
++	// head should not be updated before desc write completes
++	// also, dma_wmb() does not provide guarantees for mmio writes
++	wmb();
++
++	iowrite32(next, &ring->head);
++}
++
++int spsc_read_inject_batch(spsc_ring_t* inject_ring, pkt_desc_t *desc_array, int desc_array_sz)
++{
++	int count = desc_array_sz;
++	uint32_t head, tail, num_slots, slot_sz;
++	int ready_count;
++	int i;
++
++	head = gdr.inject_ring->head;
++	tail = gdr.inject_ring->tail;
++	num_slots = gdr.inject_ring->num_slots;
++	slot_sz = gdr.inject_ring->slot_sz;
++
++	ready_count = (head - tail + num_slots) % num_slots;
++	if (ready_count < count)
++		count = ready_count;
++
++	if (count == 0)
++		return 0;
++
++	for (i = 0; i < count; i++) {
++		desc_array[i] = *(pkt_desc_t*)(gdr.inject_ring->va2.kernel_va + slot_sz * tail);
++		if (desc_array[i].magic != GDR_MAGIC) {
++			// Using BUG() hangs the system, lets avoid that
++			for (;;) {
++				pr_alert("spsc_read_inject_batch invalid magic!\n");
++			}
++		}
++		tail = (tail + 1) % num_slots;
++	}
++
++	mb();
++
++	return count;
++}
++
++void spsc_read_inject_complete(spsc_ring_t* inject_ring, int count)
++{
++	uint32_t tail = gdr.inject_ring->tail;
++
++	tail = (tail + count) % gdr.inject_ring->num_slots;
++	gdr.inject_ring->tail = tail;
++}
++
++int enable_gdr(gdr_mem_setup_t mem_setup)
++{
++	uint32_t page_size;
++	int slots_per_page;
++	uint64_t gpu_va, dma_addr;
++	pmem_desc_t *desc;
++	int i, j;
++	uint32_t pmem_slot_sz;
++	bool to_break;
++	uint64_t rx_va_start, redirect_va_start, tx_va_start;
++	int rx_page_idx_start, redirect_page_idx_start, tx_page_idx_start;
++	// rx, redirect, tx
++	int pages_per_queue;
++
++	if (!(gdr.adapter->netdev->features & NETIF_F_RXCSUM)) {
++		pr_alert("NEIF_F_RXCSUM is not set in netdev->features; checksum offload must be enabled!\n");
++		return -1;
++	}
++
++	gdr.mem_setup = mem_setup;
++	gdr.alloc_idx = 0;
++
++	if (pin_and_map_gpu_mem(gdr.adapter->pdev, mem_setup.pmem_addr,
++				mem_setup.pmem_length, &gdr.pmem_page_table,
++				&gdr.pmem_dma_mapping) != 0)
++		return -1;
++	if (pin_and_map_gpu_mem(gdr.adapter->pdev, mem_setup.cmem_addr,
++				mem_setup.cmem_length, &gdr.cmem_page_table,
++				&gdr.cmem_dma_mapping) != 0)
++		return -1;
++
++	if (gdr.pmem_page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB ||
++			gdr.cmem_page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB) {
++		pr_alert("GPU page size not 64KB, exiting\n");
++		return -1;
++	}
++
++	page_size = (1 << 16);
++	pmem_slot_sz = 2048;
++	slots_per_page = page_size / pmem_slot_sz;
++
++	gdr.pmem_size = 0;
++	gpu_va = (uint64_t)mem_setup.pmem_addr;
++	to_break = false;
++	for (i = 0; i < gdr.pmem_page_table->entries; i++) {
++		dma_addr = gdr.pmem_dma_mapping->dma_addresses[i];
++		for (j = 0; j < slots_per_page; j++, gpu_va += pmem_slot_sz, dma_addr += pmem_slot_sz) {
++			if (gdr.pmem_size * sizeof(pmem_desc_t) == sizeof(gdr.pmem)) {
++				pr_alert("Allocated too much pmem memory!\n");
++				to_break = true;
++				break;
++			}
++
++			desc = &gdr.pmem[gdr.pmem_size++];
++			desc->space = pmem_slot_sz;
++			desc->is_free = true;
++			desc->dma_addr = dma_addr;
++			desc->gpu_va = gpu_va;
++		}
++		if (to_break)
++			break;
++	}
++	pr_info("pmem successfully allocated: gpu va start %llu, pmem size %lu, pmem entries %d\n", 
++			(u64)mem_setup.pmem_addr, mem_setup.pmem_length, gdr.pmem_size);
++
++	gdr.cmem_env_phys = (gpu_phys_t)gdr.cmem_page_table->pages[0]->physical_address;
++	gdr.cmem_env_mmio = ioremap((resource_size_t)gdr.cmem_env_phys, page_size);
++	if (gdr.cmem_env_mmio == NULL) {
++		pr_alert("ioremap failed while trying to map cmem config\n");
++		return -1;
++	}
++
++	gdr.rx_ring_mmio = (spsc_ring_t __iomem*)gdr.cmem_env_mmio;
++	gdr.redirect_ring_mmio = gdr.rx_ring_mmio + 1;
++	gdr.tx_ring_mmio = gdr.redirect_ring_mmio + 1;
++
++	pages_per_queue = (NUM_SLOTS * QUEUE_ENTRY_SZ) / GPU_PAGE_SIZE;
++	if (gdr.cmem_page_table->entries != (1 + 3 * pages_per_queue)) {
++		pr_alert("enable_gdr failed, page table entry count does not match with required pages_per_queue\n");
++		return -1;
++	}
++
++	rx_page_idx_start = 1;
++	redirect_page_idx_start = rx_page_idx_start + pages_per_queue;
++	tx_page_idx_start = redirect_page_idx_start + pages_per_queue;
++
++	rx_va_start = (u64)mem_setup.cmem_addr + page_size;
++	redirect_va_start = (u64)mem_setup.cmem_addr + redirect_page_idx_start * page_size;
++	tx_va_start = (u64)mem_setup.cmem_addr + tx_page_idx_start * page_size;
++
++	if (init_rx_ring(gdr.rx_ring_mmio, rx_va_start, QUEUE_ENTRY_SZ, gdr.cmem_page_table,
++				rx_page_idx_start, redirect_page_idx_start, &gdr.rx_ring_size, gdr.mmio_map_rx_ring,
++				sizeof(gdr.mmio_map_rx_ring) / sizeof(gdr.mmio_map_rx_ring[0])) < 0)
++		return -1;
++
++	if (init_redirect_ring(gdr.redirect_ring_mmio, redirect_va_start, QUEUE_ENTRY_SZ, 
++				gdr.cmem_page_table, redirect_page_idx_start, tx_page_idx_start,
++				&gdr.redirect_ring_size, gdr.phys_map_redirect_ring,
++				sizeof(gdr.phys_map_redirect_ring) / sizeof(gdr.phys_map_redirect_ring[0])) < 0)
++		return -1;
++
++	if (init_tx_ring(gdr.tx_ring_mmio, tx_va_start, QUEUE_ENTRY_SZ,
++				gdr.cmem_page_table, tx_page_idx_start, gdr.cmem_page_table->entries,
++				&gdr.tx_ring_size, gdr.phys_map_tx_ring,
++				sizeof(gdr.phys_map_tx_ring) / sizeof(gdr.phys_map_tx_ring[0])) < 0)
++		return -1;
++
++	if (gdr.rx_ring_size != NUM_SLOTS || gdr.redirect_ring_size != NUM_SLOTS
++		|| gdr.tx_ring_size != NUM_SLOTS) {
++		pr_alert("ring size not equal to NUM_SLOTS, failing!\n");
++		return -1;
++	}
++
++	gdr.inject_memory = vmalloc(IMEM_SZ);
++	if (!gdr.inject_memory) {
++		pr_alert("vmalloc failed to allocate inject memory\n");
++		return -1;
++	}
++	// inject ring is setup by kernel
++	gdr.inject_ring = (spsc_ring_t*)gdr.inject_memory;
++	gdr.inject_ring->userspace_va = NULL;
++	gdr.inject_ring->va2.kernel_va = CPU_PAGE_SIZE + (char*)gdr.inject_ring;
++	gdr.inject_ring->length_bytes = NUM_SLOTS * QUEUE_ENTRY_SZ;
++	gdr.inject_ring->head = 0;
++	gdr.inject_ring->tail = 0;
++	gdr.inject_ring->num_slots = NUM_SLOTS;
++	gdr.inject_ring->slot_sz = QUEUE_ENTRY_SZ;
++	gdr.inject_ring->magic = GDR_MAGIC;
++
++	pr_info("Taking e1000e down!\n");
++	e1000e_down(gdr.adapter, true); // hard reset to be on the safer side
++	gdr.enabled = true; // gg
++	e1000e_up(gdr.adapter);
++	pr_info("e1000e back up, gdr enabled successfully\n");
++
++	return 0;
++}
++
++void disable_gdr(void)
++{
++	if (!gdr.enabled)
++		return;
++
++	gdr.enabled = false;
++
++	vfree(gdr.inject_memory);
++
++	nvidia_p2p_dma_unmap_pages(gdr.adapter->pdev, gdr.pmem_page_table, gdr.pmem_dma_mapping);
++	nvidia_p2p_put_pages(0, 0, (u64)gdr.mem_setup.pmem_addr, gdr.pmem_page_table);
++
++	nvidia_p2p_dma_unmap_pages(gdr.adapter->pdev, gdr.cmem_page_table, gdr.cmem_dma_mapping);
++	nvidia_p2p_put_pages(0, 0, (u64)gdr.mem_setup.cmem_addr, gdr.cmem_page_table);
++
++	pr_info("disable_gdr: taking e1000e down\n");
++	e1000e_down(gdr.adapter, true);
++	e1000e_up(gdr.adapter);
++
++	pr_info("GDR disabled bye bye, normal rx path should work now\n");
++}
++
++// TODO: We should get the interface name from netdev instead of harcoding, but for that
++// chdev init needs to be shifted from module init to pci probe function
++// (multiple NICs which use e1000e will also lead to only one module being loaded, so need 
++// to modify the design for that as well..)
++#define DEVNAME "eno1_setup"
++#define DEVNAME_REDIRECT "eno1_redirect"
++#define DEVNAME_INJECT "eno1_inject"
++#define DEVNAME_TX "eno1_tx"
++
++typedef struct chdev_info {
++	int major;
++	atomic_t opened;
++	struct class* class;
++	struct device* device;
++} chdev_info_t;
++
++chdev_info_t chdev_setup;
++chdev_info_t chdev_redirect;
++chdev_info_t chdev_inject;
++chdev_info_t chdev_tx;
++
++static char* chdev_node(struct device* dev, umode_t* mode)
++{
++	if (mode && dev->devt == MKDEV(chdev_setup.major, 0))
++		*mode = 0666;
++	return NULL;
++}
++
++static int chdev_setup_open(struct inode* inode, struct file* file)
++{
++	atomic_inc(&chdev_setup.opened);
++	try_module_get(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_redirect_open(struct inode* inode, struct file* file)
++{
++	atomic_inc(&chdev_redirect.opened);
++	try_module_get(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_inject_open(struct inode* inode, struct file* file)
++{
++	atomic_inc(&chdev_inject.opened);
++	try_module_get(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_tx_open(struct inode* inode, struct file* file)
++{
++	atomic_inc(&chdev_tx.opened);
++	try_module_get(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_setup_release(struct inode* inode, struct file* file)
++{
++	atomic_dec(&chdev_setup.opened);
++	module_put(THIS_MODULE);
++
++	disable_gdr();
++	return 0;
++}
++
++static int chdev_redirect_release(struct inode* inode, struct file* file)
++{
++	atomic_dec(&chdev_redirect.opened);
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_tx_release(struct inode* inode, struct file* file)
++{
++	atomic_dec(&chdev_tx.opened);
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++// Cache coherency is likely not a problem for the inject ring
++static vm_fault_t chdev_inject_fault(struct vm_fault* vmf)
++{
++	struct vm_area_struct* vma = vmf->vma;
++	unsigned long offset;
++	struct page* page;
++
++	offset = vmf->address - vma->vm_start;
++	if (offset >= IMEM_SZ)
++		return VM_FAULT_SIGBUS;
++
++	page = vmalloc_to_page(gdr.inject_memory + offset);
++	if (!page) {
++		pr_alert("vmalloc_to_page failure despite valid offset??\n");
++		return VM_FAULT_SIGBUS;
++	}
++
++	get_page(page);
++	vmf->page = page;
++
++	return 0;
++}
++
++static const struct vm_operations_struct inject_vm_ops = {
++	.fault = chdev_inject_fault,
++};
++
++static int chdev_inject_release(struct inode* inode, struct file* file)
++{
++	atomic_dec(&chdev_inject.opened);
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++static int chdev_inject_mmap(struct file* filp, struct vm_area_struct* vma)
++{
++	unsigned long sz = vma->vm_end - vma->vm_start;
++	if (sz != IMEM_SZ)
++		return -EINVAL;
++
++	gdr.inject_ring->userspace_va = (void*)vma->vm_start + CPU_PAGE_SIZE;
++
++	vma->vm_ops = &inject_vm_ops;
++	return 0;
++}
++
++static int chdev_redirect_mmap(struct file* filp, struct vm_area_struct* vma)
++{
++	unsigned long userspace_addr = vma->vm_start;
++	unsigned long sz = vma->vm_end - vma->vm_start;
++	int num_slots = gdr.redirect_ring_size;
++	int slot_sz = ioread32(&gdr.redirect_ring_mmio->slot_sz);
++	int slots_per_page = CPU_PAGE_SIZE / slot_sz;
++	int i;
++
++	if (sz != (CPU_PAGE_SIZE + num_slots * slot_sz))
++		return -EINVAL;
++
++	vma->vm_flags |= VM_IO | VM_PFNMAP;
++	// optimization such as wc seem unnecessary, bottlenecks are elsewhere
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++
++	if (remap_pfn_range(vma, userspace_addr, (unsigned long)gdr.cmem_env_phys >> PAGE_SHIFT, 
++				CPU_PAGE_SIZE, vma->vm_page_prot))
++		return -EAGAIN;
++	userspace_addr += CPU_PAGE_SIZE;
++
++	for (i = 0; i < num_slots; i += slots_per_page,
++		userspace_addr += CPU_PAGE_SIZE) {
++		if (remap_pfn_range(vma, userspace_addr, 
++					(unsigned long)gdr.phys_map_redirect_ring[i] >> PAGE_SHIFT,
++					CPU_PAGE_SIZE, vma->vm_page_prot))
++			return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static int chdev_tx_mmap(struct file* filp, struct vm_area_struct* vma)
++{
++	unsigned long userspace_addr = vma->vm_start;
++	unsigned long sz = vma->vm_end - vma->vm_start;
++	int num_slots = gdr.tx_ring_size;
++	int slot_sz = ioread32(&gdr.tx_ring_mmio->slot_sz);
++	int slots_per_page = CPU_PAGE_SIZE / slot_sz;
++	int i;
++
++	if (sz != (CPU_PAGE_SIZE + num_slots * slot_sz))
++		return -EINVAL;
++
++	vma->vm_flags |= VM_IO | VM_PFNMAP;
++	// optimization such as wc seem unnecessary, bottlenecks are elsewhere
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++
++	if (remap_pfn_range(vma, userspace_addr, (unsigned long)gdr.cmem_env_phys >> PAGE_SHIFT, 
++				CPU_PAGE_SIZE, vma->vm_page_prot))
++		return -EAGAIN;
++	userspace_addr += CPU_PAGE_SIZE;
++
++	for (i = 0; i < num_slots; i += slots_per_page,
++		userspace_addr += CPU_PAGE_SIZE) {
++		if (remap_pfn_range(vma, userspace_addr, 
++					(unsigned long)gdr.phys_map_tx_ring[i] >> PAGE_SHIFT,
++					CPU_PAGE_SIZE, vma->vm_page_prot))
++			return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static ssize_t chdev_setup_write(struct file* filp, const char* buff, size_t len,
++		loff_t* off)
++{
++	gdr_mem_setup_t mem_setup;
++	if (gdr.enabled) {
++		return -EINVAL;
++	}
++	if (len != sizeof(mem_setup))
++		return -EINVAL;
++
++	if (copy_from_user(&mem_setup, buff, len))
++		return -EINVAL;
++	if (mem_setup.magic != GDR_MAGIC)
++		return -EINVAL;
++
++	if (enable_gdr(mem_setup) < 0)
++		return -EINVAL;
++
++	pr_info("chdev write successful\n");
++	return len;
++}
++
++static ssize_t chdev_inject_write(struct file* filp, const char* buff, size_t len,
++		loff_t* off)
++{
++	if (!gdr.enabled) 
++		return -EINVAL;
++	if (len != 1)
++		return -EINVAL;
++	//napi_schedule(&gdr.adapter->napi);
++	return len;
++}
++
++static ssize_t chdev_inject_read(struct file* filp, char* ubuf, size_t length, loff_t* offset)
++{
++    if (length != 0)
++	return -EINVAL;
++
++    wait_event_interruptible(gdr.userspace_wq, (atomic_read(&gdr.wake_up_userspace) == 1));
++    atomic_set(&gdr.wake_up_userspace, 0);
++
++    return length;
++}
++
++static struct file_operations fops_setup = {
++	.write = chdev_setup_write,
++	.open = chdev_setup_open,
++	.release = chdev_setup_release,
++};
++
++static struct file_operations fops_inject = {
++	.write = chdev_inject_write,
++	.open = chdev_inject_open,
++	.release = chdev_inject_release,
++	.mmap = chdev_inject_mmap,
++	.read = chdev_inject_read,
++};
++
++static struct file_operations fops_redirect = {
++	.open = chdev_redirect_open,
++	.release = chdev_redirect_release,
++	.mmap = chdev_redirect_mmap,
++};
++
++static struct file_operations fops_tx = {
++	.open = chdev_tx_open,
++	.release = chdev_tx_release,
++	.mmap = chdev_tx_mmap,
++};
++
++/* GDR Code End */
++
+ /**
+  * __ew32_prepare - prepare to write to MAC CSR register on certain parts
+  * @hw: pointer to the HW structure
+@@ -553,7 +1338,8 @@ static void e1000_receive_skb(struct e1000_adapter *adapter,
+ {
+ 	u16 tag = le16_to_cpu(vlan);
+ 
+-	e1000e_rx_hwtstamp(adapter, staterr, skb);
++	if (!gdr.enabled) 
++		e1000e_rx_hwtstamp(adapter, staterr, skb);
+ 
+ 	skb->protocol = eth_type_trans(skb, netdev);
+ 
+@@ -601,6 +1387,22 @@ static void e1000_rx_checksum(struct e1000_adapter *adapter, u32 status_err,
+ 	adapter->hw_csum_good++;
+ }
+ 
++// returns 1 if checksum is valid
++static int gdr_rx_checksum(u32 status_err)
++{
++	u16 status = (u16)status_err;
++	u8 errors = (u8)(status_err >> 24);
++
++	if (status & E1000_RXD_STAT_IXSM)
++		return 0;
++	if (errors & (E1000_RXD_ERR_TCPE | E1000_RXD_ERR_IPE))
++		return 0;
++	if (!(status & (E1000_RXD_STAT_TCPCS | E1000_RXD_STAT_UDPCS)))
++		return 0;
++
++	return 1;
++}
++
+ static void e1000e_update_rdt_wa(struct e1000_ring *rx_ring, unsigned int i)
+ {
+ 	struct e1000_adapter *adapter = rx_ring->adapter;
+@@ -653,32 +1455,50 @@ static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
+ 	unsigned int i;
+ 	unsigned int bufsz = adapter->rx_buffer_len;
+ 
++	struct pmem_desc* desc;
++
+ 	i = rx_ring->next_to_use;
+ 	buffer_info = &rx_ring->buffer_info[i];
+ 
+ 	while (cleaned_count--) {
+-		skb = buffer_info->skb;
+-		if (skb) {
+-			skb_trim(skb, 0);
+-			goto map_skb;
+-		}
++		if (gdr.enabled) {
++			if (!gdr.pmem[gdr.alloc_idx].is_free) {
++				pr_alert("Overwriting not yet freed pmem slot, increase pmem size!\n");
++			}
+ 
+-		skb = __netdev_alloc_skb_ip_align(netdev, bufsz, gfp);
+-		if (!skb) {
+-			/* Better luck next round */
+-			adapter->alloc_rx_buff_failed++;
+-			break;
+-		}
++			desc = &gdr.pmem[gdr.alloc_idx];
++			desc->is_free = false;
+ 
+-		buffer_info->skb = skb;
++			// overload skb to instead hold struct pmem_desc*
++			skb = (struct sk_buff*)desc;
++			buffer_info->skb = skb;
++			buffer_info->dma = gdr.pmem[gdr.alloc_idx].dma_addr;
++
++			gdr.alloc_idx = (gdr.alloc_idx + 1) % gdr.pmem_size;
++		} else {
++			skb = buffer_info->skb;
++			if (skb) {
++				skb_trim(skb, 0);
++				goto map_skb;
++			}
++
++			skb = __netdev_alloc_skb_ip_align(netdev, bufsz, gfp);
++			if (!skb) {
++				/* Better luck next round */
++				adapter->alloc_rx_buff_failed++;
++				break;
++			}
++
++			buffer_info->skb = skb;
+ map_skb:
+-		buffer_info->dma = dma_map_single(&pdev->dev, skb->data,
+-						  adapter->rx_buffer_len,
+-						  DMA_FROM_DEVICE);
+-		if (dma_mapping_error(&pdev->dev, buffer_info->dma)) {
+-			dev_err(&pdev->dev, "Rx DMA map failed\n");
+-			adapter->rx_dma_failed++;
+-			break;
++			buffer_info->dma = dma_map_single(&pdev->dev, skb->data,
++							  adapter->rx_buffer_len,
++							  DMA_FROM_DEVICE);
++			if (dma_mapping_error(&pdev->dev, buffer_info->dma)) {
++				dev_err(&pdev->dev, "Rx DMA map failed\n");
++				adapter->rx_dma_failed++;
++				break;
++			}
+ 		}
+ 
+ 		rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
+@@ -900,6 +1720,41 @@ static inline void e1000_rx_hash(struct net_device *netdev, __le32 rss,
+ 		skb_set_hash(skb, le32_to_cpu(rss), PKT_HASH_TYPE_L3);
+ }
+ 
++int inject_packets(int count)
++{
++#define INJECT_BATCH_SZ 16
++	pkt_desc_t desc_array[INJECT_BATCH_SZ];
++	pkt_info_t *pkt_info;
++	pkt_desc_t *pkt_desc;
++	struct sk_buff *skb;
++	int ret;
++	int i;
++
++	if (INJECT_BATCH_SZ < count)
++		count = INJECT_BATCH_SZ;
++
++	ret = spsc_read_inject_batch(gdr.inject_ring, desc_array, count);
++	if (ret < count)
++		count = ret;
++
++	for (i = 0; i < count; i++) {
++		pkt_desc = &desc_array[i];
++		pkt_info = (pkt_info_t*)(pkt_desc->nic_info);
++		skb = __netdev_alloc_skb_ip_align(gdr.adapter->netdev, gdr.adapter->rx_buffer_len, GFP_ATOMIC);
++		skb_put(skb, pkt_desc->length);
++		memcpy(skb->data, gdr.inject_memory + pkt_desc->offset, pkt_desc->length);
++
++		e1000_rx_checksum(gdr.adapter, pkt_info->staterr, skb);
++		e1000_rx_hash(gdr.adapter->netdev, pkt_info->rx_desc.wb.lower.hi_dword.rss, skb);
++		e1000_receive_skb(gdr.adapter, gdr.adapter->netdev, skb,
++				pkt_info->staterr, pkt_info->rx_desc.wb.upper.vlan);
++	}
++
++	spsc_read_inject_complete(gdr.inject_ring, count);
++
++	return count;
++}
++
+ /**
+  * e1000_clean_rx_irq - Send received data up the network stack
+  * @rx_ring: Rx descriptor ring
+@@ -923,6 +1778,14 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 	int cleaned_count = 0;
+ 	bool cleaned = false;
+ 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
++	int work_left;
++	int packets_inject_cnt;
++
++	pkt_desc_t pkt_desc;
++	pkt_info_t *pkt_info;
++	pmem_desc_t *pmem_desc;
++
++	struct sk_buff *skb;
+ 
+ 	i = rx_ring->next_to_clean;
+ 	rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
+@@ -930,8 +1793,6 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 	buffer_info = &rx_ring->buffer_info[i];
+ 
+ 	while (staterr & E1000_RXD_STAT_DD) {
+-		struct sk_buff *skb;
+-
+ 		if (*work_done >= work_to_do)
+ 			break;
+ 		(*work_done)++;
+@@ -940,7 +1801,8 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 		skb = buffer_info->skb;
+ 		buffer_info->skb = NULL;
+ 
+-		prefetch(skb->data - NET_IP_ALIGN);
++		if (!gdr.enabled)
++			prefetch(skb->data - NET_IP_ALIGN);
+ 
+ 		i++;
+ 		if (i == rx_ring->count)
+@@ -952,9 +1814,12 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 
+ 		cleaned = true;
+ 		cleaned_count++;
+-		dma_unmap_single(&pdev->dev, buffer_info->dma,
+-				 adapter->rx_buffer_len, DMA_FROM_DEVICE);
+-		buffer_info->dma = 0;
++		
++		if (!gdr.enabled) {
++			dma_unmap_single(&pdev->dev, buffer_info->dma,
++					 adapter->rx_buffer_len, DMA_FROM_DEVICE);
++			buffer_info->dma = 0;
++		}
+ 
+ 		length = le16_to_cpu(rx_desc->wb.upper.length);
+ 
+@@ -971,7 +1836,8 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 			/* All receives must fit into a single buffer */
+ 			e_dbg("Receive packet consumed multiple buffers\n");
+ 			/* recycle */
+-			buffer_info->skb = skb;
++			if (!gdr.enabled)
++				buffer_info->skb = skb;
+ 			if (staterr & E1000_RXD_STAT_EOP)
+ 				adapter->flags2 &= ~FLAG2_IS_DISCARDING;
+ 			goto next_desc;
+@@ -980,57 +1846,103 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 		if (unlikely((staterr & E1000_RXDEXT_ERR_FRAME_ERR_MASK) &&
+ 			     !(netdev->features & NETIF_F_RXALL))) {
+ 			/* recycle */
+-			buffer_info->skb = skb;
++			if (!gdr.enabled)
++				buffer_info->skb = skb;
+ 			goto next_desc;
+ 		}
+ 
+-		/* adjust length to remove Ethernet CRC */
+-		if (!(adapter->flags2 & FLAG2_CRC_STRIPPING)) {
+-			/* If configured to store CRC, don't subtract FCS,
+-			 * but keep the FCS bytes out of the total_rx_bytes
+-			 * counter
++		if (!gdr.enabled) {
++			/* adjust length to remove Ethernet CRC */
++			if (!(adapter->flags2 & FLAG2_CRC_STRIPPING)) {
++				/* If configured to store CRC, don't subtract FCS,
++				 * but keep the FCS bytes out of the total_rx_bytes
++				 * counter
++				 */
++				if (netdev->features & NETIF_F_RXFCS)
++					total_rx_bytes -= 4;
++				else
++					length -= 4;
++			}
++
++			total_rx_bytes += length;
++			total_rx_packets++;
++
++			/* code added for copybreak, this should improve
++			 * performance for small packets with large amounts
++			 * of reassembly being done in the stack
+ 			 */
+-			if (netdev->features & NETIF_F_RXFCS)
+-				total_rx_bytes -= 4;
+-			else
+-				length -= 4;
+-		}
++			if (length < copybreak) {
++				struct sk_buff *new_skb =
++					napi_alloc_skb(&adapter->napi, length);
++				if (new_skb) {
++					skb_copy_to_linear_data_offset(new_skb,
++								       -NET_IP_ALIGN,
++								       (skb->data -
++									NET_IP_ALIGN),
++								       (length +
++									NET_IP_ALIGN));
++					/* save the skb in buffer_info as good */
++					buffer_info->skb = skb;
++					skb = new_skb;
++				}
++				/* else just continue with the old one */
++			}
++			/* end copybreak code */
++			skb_put(skb, length);
+ 
+-		total_rx_bytes += length;
+-		total_rx_packets++;
++			/* Receive Checksum Offload */
++			e1000_rx_checksum(adapter, staterr, skb);
+ 
+-		/* code added for copybreak, this should improve
+-		 * performance for small packets with large amounts
+-		 * of reassembly being done in the stack
+-		 */
+-		if (length < copybreak) {
+-			struct sk_buff *new_skb =
+-				napi_alloc_skb(&adapter->napi, length);
+-			if (new_skb) {
+-				skb_copy_to_linear_data_offset(new_skb,
+-							       -NET_IP_ALIGN,
+-							       (skb->data -
+-								NET_IP_ALIGN),
+-							       (length +
+-								NET_IP_ALIGN));
+-				/* save the skb in buffer_info as good */
+-				buffer_info->skb = skb;
+-				skb = new_skb;
++			e1000_rx_hash(netdev, rx_desc->wb.lower.hi_dword.rss, skb);
++
++			e1000_receive_skb(adapter, netdev, skb, staterr,
++					  rx_desc->wb.upper.vlan);
++		} else {
++			if (!(adapter->flags2 & FLAG2_CRC_STRIPPING)) {
++				if (netdev->features & NETIF_F_RXFCS)
++					total_rx_bytes -= 4;
++				else
++					length -= 4;
++			}
++			
++			// skb was overloaded to hold struct pmem_desc*
++			pmem_desc = (pmem_desc_t*)skb;
++			pmem_desc->is_free = true;
++			if (pmem_desc->space < length) {
++				pr_alert("pmem slot size of %zu is insufficient for packet size %u, dropping\n",
++						pmem_desc->space, length);
++				goto next_desc;
+ 			}
+-			/* else just continue with the old one */
+-		}
+-		/* end copybreak code */
+-		skb_put(skb, length);
+ 
+-		/* Receive Checksum Offload */
+-		e1000_rx_checksum(adapter, staterr, skb);
++			// If we simply drop all packets with unverified checksums, we also drop ICMP packets etc. 
++			// which belong to host. Instead just set a flag which GPU TCP stack will inspect
++			if (gdr_rx_checksum(staterr)) {
++			    pkt_desc.checksum_verified = 1;
++			} else {
++			    pkt_desc.checksum_verified = 0;
++			}
+ 
+-		e1000_rx_hash(netdev, rx_desc->wb.lower.hi_dword.rss, skb);
++			pkt_info = (pkt_info_t*)pkt_desc.nic_info;
++			pkt_info->length = length;
++			pkt_info->staterr = staterr;
++			pkt_info->rx_desc = *rx_desc;
+ 
+-		e1000_receive_skb(adapter, netdev, skb, staterr,
+-				  rx_desc->wb.upper.vlan);
++			pkt_desc.gpu_va = (void*)pmem_desc->gpu_va;
++			pkt_desc.length = length;
++			pkt_desc.magic = GDR_MAGIC;
++
++			spsc_write(gdr.rx_ring_mmio, gdr.mmio_map_rx_ring, &pkt_desc);
++		}
+ 
+ next_desc:
++		if (gdr.enabled) {
++			// To minimize latency inject packets in each iteration of the loop, since we are anyway 
++			// hitting the NIC throughput ceiling of 1Gbps.
++			// If higher throughputs are needed, batch this packet injection while trading off some 
++			// latency.
++			inject_packets(1);
++		}
++
+ 		rx_desc->wb.upper.status_error &= cpu_to_le32(~0xFF);
+ 
+ 		/* return some buffers to hardware, one at a time is too slow */
+@@ -1048,6 +1960,28 @@ next_desc:
+ 	}
+ 	rx_ring->next_to_clean = i;
+ 
++	if (gdr.enabled) {
++		work_left = work_to_do - *work_done;
++		if (work_left) {
++			packets_inject_cnt = 0;
++			while (work_left) {
++				packets_inject_cnt = inject_packets(work_left);
++				if (!packets_inject_cnt)
++					break;
++				work_left -= packets_inject_cnt;
++			}
++			if (packets_inject_cnt)
++				*work_done = work_to_do;
++		}
++
++		atomic_set(&gdr.wake_up_userspace, 1);
++		wake_up_interruptible(&gdr.userspace_wq);
++
++		// NOTE: Uncomment the below line to keep NAPI always in polling mode. 
++		// Interrupts are never enabled, ksoftirq cpu usage -> 100%.
++		//*work_done = work_to_do;
++	}
++
+ 	cleaned_count = e1000_desc_unused(rx_ring);
+ 	if (cleaned_count)
+ 		adapter->alloc_rx_buf(rx_ring, cleaned_count, GFP_ATOMIC);
+@@ -1687,30 +2621,34 @@ static void e1000_clean_rx_ring(struct e1000_ring *rx_ring)
+ 	/* Free all the Rx ring sk_buffs */
+ 	for (i = 0; i < rx_ring->count; i++) {
+ 		buffer_info = &rx_ring->buffer_info[i];
+-		if (buffer_info->dma) {
+-			if (adapter->clean_rx == e1000_clean_rx_irq)
+-				dma_unmap_single(&pdev->dev, buffer_info->dma,
+-						 adapter->rx_buffer_len,
+-						 DMA_FROM_DEVICE);
+-			else if (adapter->clean_rx == e1000_clean_jumbo_rx_irq)
+-				dma_unmap_page(&pdev->dev, buffer_info->dma,
+-					       PAGE_SIZE, DMA_FROM_DEVICE);
+-			else if (adapter->clean_rx == e1000_clean_rx_irq_ps)
+-				dma_unmap_single(&pdev->dev, buffer_info->dma,
+-						 adapter->rx_ps_bsize0,
+-						 DMA_FROM_DEVICE);
+-			buffer_info->dma = 0;
+-		}
++	//	if (!gdr.enabled) {
++			if (buffer_info->dma) {
++				if (adapter->clean_rx == e1000_clean_rx_irq)
++					dma_unmap_single(&pdev->dev, buffer_info->dma,
++							 adapter->rx_buffer_len,
++							 DMA_FROM_DEVICE);
++				else if (adapter->clean_rx == e1000_clean_jumbo_rx_irq)
++					dma_unmap_page(&pdev->dev, buffer_info->dma,
++						       PAGE_SIZE, DMA_FROM_DEVICE);
++				else if (adapter->clean_rx == e1000_clean_rx_irq_ps)
++					dma_unmap_single(&pdev->dev, buffer_info->dma,
++							 adapter->rx_ps_bsize0,
++							 DMA_FROM_DEVICE);
++				buffer_info->dma = 0;
++			}
++	//	}
+ 
+ 		if (buffer_info->page) {
+ 			put_page(buffer_info->page);
+ 			buffer_info->page = NULL;
+ 		}
+ 
+-		if (buffer_info->skb) {
+-			dev_kfree_skb(buffer_info->skb);
+-			buffer_info->skb = NULL;
+-		}
++	//	if (!gdr.enabled) {
++			if (buffer_info->skb) {
++				dev_kfree_skb(buffer_info->skb);
++				buffer_info->skb = NULL;
++			}
++	//	}
+ 
+ 		for (j = 0; j < PS_PAGE_BUFFERS; j++) {
+ 			ps_page = &buffer_info->ps_pages[j];
+@@ -3206,10 +4144,20 @@ static void e1000_configure_rx(struct e1000_adapter *adapter)
+ 		    sizeof(union e1000_rx_desc_packet_split);
+ 		adapter->clean_rx = e1000_clean_rx_irq_ps;
+ 		adapter->alloc_rx_buf = e1000_alloc_rx_buffers_ps;
++
++		if (gdr.enabled) {
++			pr_alert("Receive unit being set with PS mode! GDR will not work\n");
++			BUG();
++		}
+ 	} else if (adapter->netdev->mtu > ETH_FRAME_LEN + ETH_FCS_LEN) {
+ 		rdlen = rx_ring->count * sizeof(union e1000_rx_desc_extended);
+ 		adapter->clean_rx = e1000_clean_jumbo_rx_irq;
+ 		adapter->alloc_rx_buf = e1000_alloc_jumbo_rx_buffers;
++
++		if (gdr.enabled) {
++			pr_alert("Receive unit being set with Jumbo mode! GDR will not work\n");
++			BUG();
++		}
+ 	} else {
+ 		rdlen = rx_ring->count * sizeof(union e1000_rx_desc_extended);
+ 		adapter->clean_rx = e1000_clean_rx_irq;
+@@ -7453,6 +8401,8 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	adapter->max_hw_frame_size = ei->max_hw_frame_size;
+ 	adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
+ 
++	gdr.adapter = adapter;
++
+ 	mmio_start = pci_resource_start(pdev, 0);
+ 	mmio_len = pci_resource_len(pdev, 0);
+ 
+@@ -7945,6 +8895,45 @@ static struct pci_driver e1000_driver = {
+ 	.err_handler = &e1000_err_handler
+ };
+ 
++int chdev_init(chdev_info_t* info, const char* name, struct file_operations* fops)
++{
++	int err;
++
++	info->major = register_chrdev(0, name, fops);
++	err = info->major;
++	if (err < 0) {
++		pr_alert("Registering chrdev failed with %d\n", err);
++		goto error_regdev;
++	}
++
++	info->class = class_create(THIS_MODULE, name);
++	err = PTR_ERR(info->class);
++	if (IS_ERR(info->class))
++		goto error_class;
++
++	info->class->devnode = chdev_node;
++	info->device = device_create(info->class, NULL, MKDEV(info->major, 0), NULL, name);
++	err = PTR_ERR(info->device);
++	if (IS_ERR(info->device))
++		goto error_device;
++
++	return 0;
++
++error_device:
++	class_destroy(info->class);
++error_class:
++	unregister_chrdev(info->major, name);
++error_regdev:
++	return err;
++}
++
++void chdev_destroy(chdev_info_t* info, const char* name)
++{
++	device_destroy(info->class, MKDEV(info->major, 0));
++	class_destroy(info->class);
++	unregister_chrdev(info->major, name);
++}
++
+ /**
+  * e1000_init_module - Driver Registration Routine
+  *
+@@ -7953,9 +8942,57 @@ static struct pci_driver e1000_driver = {
+  **/
+ static int __init e1000_init_module(void)
+ {
++	int err;
++
+ 	pr_info("Intel(R) PRO/1000 Network Driver\n");
+ 	pr_info("Copyright(c) 1999 - 2015 Intel Corporation.\n");
+ 
++	// Sanity checks, see gdr_common.h
++	// Also ensures that the structs are packed in the same way, because 
++	// the structs are compiled by both nvcc vs gcc
++	if (sizeof(pkt_desc_t) > QUEUE_ENTRY_SZ) {
++		pr_alert("invalid QUEUE_ENTRY_SZ, aborting\n");
++		return -1;
++	}
++	if (sizeof(pkt_info_t) > NIC_INFO_SZ) {
++		pr_alert("invalid NIC_INFO_SZ, aborting\n");
++		return -1;
++	}
++	if (sizeof(gdr_mem_setup_t) != GDR_MEM_SETUP_T_SZ ||
++			sizeof(pkt_desc_t) != PKT_DESC_T_SZ ||
++			sizeof(spsc_ring_t) != SPSC_RING_T_SZ ||
++			sizeof(gdr_env_t) != GDR_CONFIG_T_SZ) {
++		pr_alert("struct size mismatch, aborting\n");
++		return -1;
++	}
++
++	gdr.enabled = false;
++	atomic_set(&gdr.wake_up_userspace, 0);
++
++	if ((err = chdev_init(&chdev_setup, DEVNAME, &fops_setup)) < 0) {
++		pr_alert("failed to create setup chdev\n");
++		return err;
++	}
++
++	if ((err = chdev_init(&chdev_redirect, DEVNAME_REDIRECT, &fops_redirect)) < 0) {
++		pr_alert("failed to create redirect chdev\n");
++		return err;
++	}
++
++	if ((err = chdev_init(&chdev_inject, DEVNAME_INJECT, &fops_inject)) < 0) {
++		pr_alert("failed to create inject chdev\n");
++		return err;
++	}
++
++	if ((err = chdev_init(&chdev_tx, DEVNAME_TX, &fops_tx)) < 0) {
++		pr_alert("failed to create tx chdev\n");
++		return err;
++	}
++
++	init_waitqueue_head(&gdr.userspace_wq);
++	
++	pr_info("chdevs successfully created\n");
++
+ 	return pci_register_driver(&e1000_driver);
+ }
+ module_init(e1000_init_module);
+@@ -7968,6 +9005,10 @@ module_init(e1000_init_module);
+  **/
+ static void __exit e1000_exit_module(void)
+ {
++	chdev_destroy(&chdev_tx, DEVNAME_TX);
++	chdev_destroy(&chdev_inject, DEVNAME_INJECT);
++	chdev_destroy(&chdev_redirect, DEVNAME_REDIRECT);
++	chdev_destroy(&chdev_setup, DEVNAME);
+ 	pci_unregister_driver(&e1000_driver);
+ }
+ module_exit(e1000_exit_module);
+diff --git a/nv-p2p.h b/nv-p2p.h
+new file mode 100644
+index 0000000..e0d54ed
+--- /dev/null
++++ b/nv-p2p.h
+@@ -0,0 +1,479 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2011-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef _NV_P2P_H_
++#define _NV_P2P_H_
++
++/*
++ * NVIDIA P2P Structure Versioning
++ *
++ * For the nvidia_p2p_*_t structures allocated by the NVIDIA driver, it will
++ * set the version field of the structure according to the definition used by
++ * the NVIDIA driver. The "major" field of the version is defined as the upper
++ * 16 bits, and the "minor" field of the version is defined as the lower 16
++ * bits. The version field will always be the first 4 bytes of the structure,
++ * and third-party drivers should check the value of this field in structures
++ * allocated by the NVIDIA driver to ensure runtime compatibility.
++ *
++ * In general, version numbers will be incremented as follows:
++ * - When a backwards-compatible change is made to the structure layout, the
++ *   minor version for that structure will be incremented. Third-party drivers
++ *   built against an older minor version will continue to work with the newer
++ *   minor version used by the NVIDIA driver, without recompilation.
++ * - When a breaking change is made to the structure layout, the major version
++ *   will be incremented. Third-party drivers built against an older major
++ *   version require at least recompilation and potentially additional updates
++ *   to use the new API.
++ */
++#define NVIDIA_P2P_MAJOR_VERSION_MASK   0xffff0000
++#define NVIDIA_P2P_MINOR_VERSION_MASK   0x0000ffff
++
++#define NVIDIA_P2P_MAJOR_VERSION(v) \
++    (((v) & NVIDIA_P2P_MAJOR_VERSION_MASK) >> 16)
++
++#define NVIDIA_P2P_MINOR_VERSION(v) \
++    (((v) & NVIDIA_P2P_MINOR_VERSION_MASK))
++
++#define NVIDIA_P2P_MAJOR_VERSION_MATCHES(p, v) \
++    (NVIDIA_P2P_MAJOR_VERSION((p)->version) == NVIDIA_P2P_MAJOR_VERSION(v))
++
++#define NVIDIA_P2P_VERSION_COMPATIBLE(p, v)    \
++    (NVIDIA_P2P_MAJOR_VERSION_MATCHES(p, v) && \
++     (NVIDIA_P2P_MINOR_VERSION((p)->version) >= (NVIDIA_P2P_MINOR_VERSION(v))))
++
++enum {
++    NVIDIA_P2P_ARCHITECTURE_TESLA = 0,
++    NVIDIA_P2P_ARCHITECTURE_FERMI,
++    NVIDIA_P2P_ARCHITECTURE_CURRENT = NVIDIA_P2P_ARCHITECTURE_FERMI
++};
++
++#define NVIDIA_P2P_PARAMS_VERSION   0x00010001
++
++enum {
++    NVIDIA_P2P_PARAMS_ADDRESS_INDEX_GPU = 0,
++    NVIDIA_P2P_PARAMS_ADDRESS_INDEX_THIRD_PARTY_DEVICE,
++    NVIDIA_P2P_PARAMS_ADDRESS_INDEX_MAX = \
++        NVIDIA_P2P_PARAMS_ADDRESS_INDEX_THIRD_PARTY_DEVICE
++};
++
++#define NVIDIA_P2P_GPU_UUID_LEN   16
++
++typedef
++struct nvidia_p2p_params {
++    uint32_t version;
++    uint32_t architecture;
++    union nvidia_p2p_mailbox_addresses {
++        struct {
++            uint64_t wmb_addr;
++            uint64_t wmb_data;
++            uint64_t rreq_addr;
++            uint64_t rcomp_addr;
++            uint64_t reserved[2];
++        } fermi;
++    } addresses[NVIDIA_P2P_PARAMS_ADDRESS_INDEX_MAX+1];
++} nvidia_p2p_params_t;
++
++/*
++ * Macro for users to detect
++ * driver support for persistent pages.
++ */
++#define NVIDIA_P2P_CAP_GET_PAGES_PERSISTENT_API
++
++/*
++ * This API is not supported.
++ */
++int nvidia_p2p_init_mapping(uint64_t p2p_token,
++        struct nvidia_p2p_params *params,
++        void (*destroy_callback)(void *data),
++        void *data);
++
++/*
++ * This API is not supported.
++ */
++int nvidia_p2p_destroy_mapping(uint64_t p2p_token);
++
++enum nvidia_p2p_page_size_type {
++    NVIDIA_P2P_PAGE_SIZE_4KB = 0,
++    NVIDIA_P2P_PAGE_SIZE_64KB,
++    NVIDIA_P2P_PAGE_SIZE_128KB,
++    NVIDIA_P2P_PAGE_SIZE_COUNT
++};
++
++typedef
++struct nvidia_p2p_page {
++    uint64_t physical_address;
++    union nvidia_p2p_request_registers {
++        struct {
++            uint32_t wreqmb_h;
++            uint32_t rreqmb_h;
++            uint32_t rreqmb_0;
++            uint32_t reserved[3];
++        } fermi;
++    } registers;
++} nvidia_p2p_page_t;
++
++#define NVIDIA_P2P_PAGE_TABLE_VERSION   0x00010002
++
++#define NVIDIA_P2P_PAGE_TABLE_VERSION_COMPATIBLE(p) \
++    NVIDIA_P2P_VERSION_COMPATIBLE(p, NVIDIA_P2P_PAGE_TABLE_VERSION)
++
++typedef
++struct nvidia_p2p_page_table {
++    uint32_t version;
++    uint32_t page_size; /* enum nvidia_p2p_page_size_type */
++    struct nvidia_p2p_page **pages;
++    uint32_t entries;
++    uint8_t *gpu_uuid;
++} nvidia_p2p_page_table_t;
++
++/*
++ * @brief
++ *   Make the pages underlying a range of GPU virtual memory
++ *   accessible to a third-party device.
++ *
++ *   This API only supports pinned, GPU-resident memory, such as that provided
++ *   by cudaMalloc().
++ *
++ *   This API may sleep.
++ *
++ * @param[in]     p2p_token
++ *   A token that uniquely identifies the P2P mapping.
++ * @param[in]     va_space
++ *   A GPU virtual address space qualifier.
++ * @param[in]     virtual_address
++ *   The start address in the specified virtual address space.
++ *   Address must be aligned to the 64KB boundary.
++ * @param[in]     length
++ *   The length of the requested P2P mapping.
++ *   Length must be a multiple of 64KB.
++ * @param[out]    page_table
++ *   A pointer to an array of structures with P2P PTEs.
++ * @param[in]     free_callback
++ *   A pointer to the function to be invoked when the pages
++ *   underlying the virtual address range are freed
++ *   implicitly.
++ * @param[in]     data
++ *   A non-NULL opaque pointer to private data to be passed to the
++ *   callback function.
++ *
++ * @return
++ *    0           upon successful completion.
++ *   -EINVAL      if an invalid argument was supplied.
++ *   -ENOTSUPP    if the requested operation is not supported.
++ *   -ENOMEM      if the driver failed to allocate memory or if
++ *     insufficient resources were available to complete the operation.
++ *   -EIO         if an unknown error occurred.
++ */
++int nvidia_p2p_get_pages( uint64_t p2p_token, uint32_t va_space,
++        uint64_t virtual_address, uint64_t length,
++        struct nvidia_p2p_page_table **page_table,
++        void (*free_callback)(void *data), void *data);
++
++/*
++ * @brief
++ *   Pin and make the pages underlying a range of GPU virtual memory
++ *   accessible to a third-party device. The pages will persist until
++ *   explicitly freed by nvidia_p2p_put_pages_persistent().
++ *
++ *   Persistent GPU memory mappings are not supported on PowerPC,
++ *   MIG-enabled devices and vGPU.
++ *
++ *   This API only supports pinned, GPU-resident memory, such as that provided
++ *   by cudaMalloc().
++ *
++ *   This API may sleep.
++ *
++ * @param[in]     virtual_address
++ *   The start address in the specified virtual address space.
++ *   Address must be aligned to the 64KB boundary.
++ * @param[in]     length
++ *   The length of the requested P2P mapping.
++ *   Length must be a multiple of 64KB.
++ * @param[out]    page_table
++ *   A pointer to an array of structures with P2P PTEs.
++ * @param[in]     flags
++ *   Must be set to zero for now.
++ *
++ * @return
++ *    0           upon successful completion.
++ *   -EINVAL      if an invalid argument was supplied.
++ *   -ENOTSUPP    if the requested operation is not supported.
++ *   -ENOMEM      if the driver failed to allocate memory or if
++ *     insufficient resources were available to complete the operation.
++ *   -EIO         if an unknown error occurred.
++ */
++int nvidia_p2p_get_pages_persistent(uint64_t virtual_address,
++        uint64_t length,
++        struct nvidia_p2p_page_table **page_table,
++        uint32_t flags);
++
++#define NVIDIA_P2P_DMA_MAPPING_VERSION   0x00020003
++
++#define NVIDIA_P2P_DMA_MAPPING_VERSION_COMPATIBLE(p) \
++    NVIDIA_P2P_VERSION_COMPATIBLE(p, NVIDIA_P2P_DMA_MAPPING_VERSION)
++
++struct pci_dev;
++
++typedef
++struct nvidia_p2p_dma_mapping {
++    uint32_t version;
++    enum nvidia_p2p_page_size_type page_size_type;
++    uint32_t entries;
++    uint64_t *dma_addresses;
++    void *private;
++    struct pci_dev *pci_dev;
++} nvidia_p2p_dma_mapping_t;
++
++/*
++ * @brief
++ *   Make the physical pages retrieved using nvidia_p2p_get_pages accessible to
++ *   a third-party device.
++ *
++ * @param[in]     peer
++ *   The struct pci_dev * of the peer device that needs to DMA to/from the
++ *   mapping.
++ * @param[in]     page_table
++ *   The page table outlining the physical pages underlying the mapping, as
++ *   retrieved with nvidia_p2p_get_pages().
++ * @param[out]    dma_mapping
++ *   The DMA mapping containing the DMA addresses to use on the third-party
++ *   device.
++ *
++ * @return
++ *    0           upon successful completion.
++ *    -EINVAL     if an invalid argument was supplied.
++ *    -ENOTSUPP   if the requested operation is not supported.
++ *    -EIO        if an unknown error occurred.
++ */
++int nvidia_p2p_dma_map_pages(struct pci_dev *peer,
++        struct nvidia_p2p_page_table *page_table,
++        struct nvidia_p2p_dma_mapping **dma_mapping);
++
++/*
++ * @brief
++ *   Unmap the physical pages previously mapped to the third-party device by
++ *   nvidia_p2p_dma_map_pages().
++ *
++ * @param[in]     peer
++ *   The struct pci_dev * of the peer device that the DMA mapping belongs to.
++ * @param[in]     page_table
++ *   The page table backing the DMA mapping to be unmapped.
++ * @param[in]     dma_mapping
++ *   The DMA mapping containing the DMA addresses used by the third-party
++ *   device, as retrieved with nvidia_p2p_dma_map_pages(). After this call
++ *   returns, neither this struct nor the addresses contained within will be
++ *   valid for use by the third-party device.
++ *
++ * @return
++ *    0           upon successful completion.
++ *    -EINVAL     if an invalid argument was supplied.
++ *    -EIO        if an unknown error occurred.
++ */
++int nvidia_p2p_dma_unmap_pages(struct pci_dev *peer,
++        struct nvidia_p2p_page_table *page_table,
++        struct nvidia_p2p_dma_mapping *dma_mapping);
++
++/*
++ * @brief
++ *   Release a set of pages previously made accessible to
++ *   a third-party device.
++ *
++ *   This API may sleep.
++ *
++ * @param[in]     p2p_token
++ *   A token that uniquely identifies the P2P mapping.
++ * @param[in]     va_space
++ *   A GPU virtual address space qualifier.
++ * @param[in]     virtual_address
++ *   The start address in the specified virtual address space.
++ * @param[in]     page_table
++ *   A pointer to the array of structures with P2P PTEs.
++ *
++ * @return
++ *    0           upon successful completion.
++ *   -EINVAL      if an invalid argument was supplied.
++ *   -EIO         if an unknown error occurred.
++ */
++int nvidia_p2p_put_pages(uint64_t p2p_token,
++        uint32_t va_space, uint64_t virtual_address,
++        struct nvidia_p2p_page_table *page_table);
++
++/*
++ * @brief
++ *   Release a set of persistent pages previously made accessible to
++ *   a third-party device.
++ *
++ *   This API may sleep.
++ *
++ * @param[in]     virtual_address
++ *   The start address in the specified virtual address space.
++ * @param[in]     page_table
++ *   A pointer to the array of structures with P2P PTEs.
++ * @param[in]     flags
++ *   Must be set to zero for now.
++ *
++ * @return
++ *    0           upon successful completion.
++ *   -EINVAL      if an invalid argument was supplied.
++ *   -EIO         if an unknown error occurred.
++ */
++int nvidia_p2p_put_pages_persistent(uint64_t virtual_address,
++        struct nvidia_p2p_page_table *page_table,
++        uint32_t flags);
++
++/*
++ * @brief
++ *    Free a third-party P2P page table. (This function is a no-op.)
++ *
++ * @param[in]     page_table
++ *   A pointer to the array of structures with P2P PTEs.
++ *
++ * @return
++ *    0           upon successful completion.
++ *   -EINVAL      if an invalid argument was supplied.
++ */
++int nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table);
++
++/*
++ * @brief
++ *   Free a third-party P2P DMA mapping. (This function is a no-op.)
++ *
++ * @param[in]     dma_mapping
++ *   A pointer to the DMA mapping structure.
++ *
++ * @return
++ *    0           upon successful completion.
++ *    -EINVAL     if an invalid argument was supplied.
++ */
++int nvidia_p2p_free_dma_mapping(struct nvidia_p2p_dma_mapping *dma_mapping);
++
++#define NVIDIA_P2P_RSYNC_DRIVER_VERSION   0x00010001
++
++#define NVIDIA_P2P_RSYNC_DRIVER_VERSION_COMPATIBLE(p) \
++    NVIDIA_P2P_VERSION_COMPATIBLE(p, NVIDIA_P2P_RSYNC_DRIVER_VERSION)
++
++typedef
++struct nvidia_p2p_rsync_driver {
++    uint32_t version;
++    int (*get_relaxed_ordering_mode)(int *mode, void *data);
++    void (*put_relaxed_ordering_mode)(int mode, void *data);
++    void (*wait_for_rsync)(struct pci_dev *gpu, void *data);
++} nvidia_p2p_rsync_driver_t;
++
++/*
++ * @brief
++ *   Registers the rsync driver.
++ *
++ * @param[in]     driver
++ *   A pointer to the rsync driver structure. The NVIDIA driver would use,
++ *
++ *   get_relaxed_ordering_mode to obtain a reference to the current relaxed
++ *   ordering mode (treated as a boolean) from the rsync driver.
++ *
++ *   put_relaxed_ordering_mode to release a reference to the current relaxed
++ *   ordering mode back to the rsync driver. The NVIDIA driver will call this
++ *   function once for each successful call to get_relaxed_ordering_mode, and
++ *   the relaxed ordering mode must not change until the last reference is
++ *   released.
++ *
++ *   wait_for_rsync to call into the rsync module to issue RSYNC. This callback
++ *   can't sleep or re-schedule as it may arrive under spinlocks.
++ * @param[in]     data
++ *   A pointer to the rsync driver's private data.
++ *
++ * @Returns
++ *   0            upon successful completion.
++ *   -EINVAL      parameters are incorrect.
++ *   -EBUSY       if a module is already registered or GPU devices are in use.
++ */
++int nvidia_p2p_register_rsync_driver(nvidia_p2p_rsync_driver_t *driver,
++                                     void *data);
++
++/*
++ * @brief
++ *   Unregisters the rsync driver.
++ *
++ * @param[in]     driver
++ *   A pointer to the rsync driver structure.
++ * @param[in]     data
++ *   A pointer to the rsync driver's private data.
++ */
++void nvidia_p2p_unregister_rsync_driver(nvidia_p2p_rsync_driver_t *driver,
++                                        void *data);
++
++#define NVIDIA_P2P_RSYNC_REG_INFO_VERSION   0x00020001
++
++#define NVIDIA_P2P_RSYNC_REG_INFO_VERSION_COMPATIBLE(p) \
++    NVIDIA_P2P_VERSION_COMPATIBLE(p, NVIDIA_P2P_RSYNC_REG_INFO_VERSION)
++
++typedef struct nvidia_p2p_rsync_reg {
++    void *ptr;
++    size_t size;
++    struct pci_dev *ibmnpu;
++    struct pci_dev *gpu;
++    uint32_t cluster_id;
++    uint32_t socket_id;
++} nvidia_p2p_rsync_reg_t;
++
++typedef struct nvidia_p2p_rsync_reg_info {
++    uint32_t version;
++    nvidia_p2p_rsync_reg_t *regs;
++    size_t entries;
++} nvidia_p2p_rsync_reg_info_t;
++
++/*
++ * @brief
++ *   Gets rsync (GEN-ID) register information associated with the supported
++ *   NPUs.
++ *
++ *   The caller would use the returned information {GPU device, NPU device,
++ *   socket-id, cluster-id} to pick the optimal generation registers to issue
++ *   RSYNC (NVLink HW flush).
++ *
++ *   The interface allocates structures to return the information, hence
++ *   nvidia_p2p_put_rsync_registers() must be called to free the structures.
++ *
++ *   Note, cluster-id is hardcoded to zero as early system configurations would
++ *   only support cluster mode i.e. all devices would share the same cluster-id
++ *   (0). In the future, appropriate kernel support would be needed to query
++ *   cluster-ids.
++ *
++ * @param[out]     reg_info
++ *   A pointer to the rsync reg info structure.
++ *
++ * @Returns
++ *   0 Upon successful completion. Otherwise, returns negative value.
++ */
++int nvidia_p2p_get_rsync_registers(nvidia_p2p_rsync_reg_info_t **reg_info);
++
++/*
++ * @brief
++ *   Frees the structures allocated by nvidia_p2p_get_rsync_registers().
++ *
++ * @param[in]     reg_info
++ *   A pointer to the rsync reg info structure.
++ */
++void nvidia_p2p_put_rsync_registers(nvidia_p2p_rsync_reg_info_t *reg_info);
++
++#endif /* _NV_P2P_H_ */
++	
